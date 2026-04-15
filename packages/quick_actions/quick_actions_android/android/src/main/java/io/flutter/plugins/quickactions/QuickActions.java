@@ -45,7 +45,8 @@ final class QuickActions implements AndroidQuickActionsApi {
   }
 
   // Returns true when running on a version of Android that supports quick actions.
-  // When this returns false, methods should silently no-op, per the documented behavior (see README.md).
+  // When this returns false, methods should silently no-op, per the documented behavior (see
+  // README.md).
   @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.N_MR1)
   boolean isVersionAllowed() {
     return Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1;
