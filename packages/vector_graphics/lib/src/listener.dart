@@ -173,6 +173,30 @@ class _PatternState {
   PictureRecorder? recorder;
 }
 
+/// The state of a mask that is currently being applied.
+///
+/// The mask content is recorded to [recorder] so that it can be replayed
+/// twice when the mask is finalized (see
+/// `FlutterVectorGraphicsListener._finalizeMask`).
+class _MaskState {
+  _MaskState(this.parentCanvas, this.recorder, this.canvas);
+
+  /// The canvas that the fully-rendered mask content is composited onto.
+  final Canvas parentCanvas;
+
+  /// The recorder that captures the mask content.
+  final PictureRecorder recorder;
+
+  /// The canvas that receives drawing while the mask is active.
+  final Canvas canvas;
+
+  /// The number of unmatched [FlutterVectorGraphicsListener.onSaveLayer] calls
+  /// within the mask content, so that their matching
+  /// [FlutterVectorGraphicsListener.onRestoreLayer] calls restore [canvas]
+  /// instead of finalizing the mask.
+  int layerDepth = 0;
+}
+
 /// Used by [FlutterVectorGraphicsListener] for testing purposes.
 @visibleForTesting
 abstract class PictureFactory {
@@ -257,6 +281,7 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
   final List<Future<void>> _pendingImages = <Future<void>>[];
   final Map<int, Image> _images = <int, Image>{};
   final Map<int, _PatternState> _patterns = <int, _PatternState>{};
+  final List<_MaskState> _masks = <_MaskState>[];
   Path? _currentPath;
   Size _size = Size.zero;
   bool _done = false;
@@ -282,14 +307,41 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
   _PatternConfig? _currentPattern;
 
   static final Paint _emptyPaint = Paint();
-  static final Paint _grayscaleDstInPaint = Paint()
+
+  /// Applies the luminance of the source to the destination alpha
+  /// (`BlendMode.dstIn`).
+  ///
+  /// This computes the luminance of the mask content from its unpremultiplied
+  /// RGB channels, per https://www.w3.org/Graphics/Color/sRGB. Because the
+  /// color matrix operates on unpremultiplied color, the alpha row cannot use
+  /// the source alpha channel (the matrix can only multiply, not cross-term
+  /// `luminance * alpha`), so the mask content's alpha is applied in a second
+  /// pass with [_dstInPaint].
+  static final Paint _lumaToAlphaPaint = Paint()
     ..blendMode = BlendMode.dstIn
     ..colorFilter = const ColorFilter.matrix(<double>[
       0, 0, 0, 0, 0, //
       0, 0, 0, 0, 0,
       0, 0, 0, 0, 0,
       0.2126, 0.7152, 0.0722, 0, 0,
-    ]); //convert to grayscale (https://www.w3.org/Graphics/Color/sRGB) and use them as transparency
+    ]);
+
+  /// Applies the alpha of the source to the destination (`BlendMode.dstIn`).
+  static final Paint _dstInPaint = Paint()..blendMode = BlendMode.dstIn;
+
+  /// The canvas that subsequent drawing commands should target, based on the
+  /// current rendering context. Drawing goes to the active pattern if one is
+  /// being built, otherwise to the active mask being recorded if one is being
+  /// applied, otherwise to the main picture canvas.
+  Canvas get _activeCanvas {
+    if (_currentPattern != null) {
+      return _patterns[_currentPattern!._patternId]!.canvas!;
+    }
+    if (_masks.isNotEmpty) {
+      return _masks.last.canvas;
+    }
+    return _canvas;
+  }
 
   /// Convert the vector graphics asset this listener decoded into a [Picture].
   ///
@@ -334,11 +386,7 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
         paint = newPaint;
       }
     }
-    if (_currentPattern != null) {
-      _patterns[_currentPattern!._patternId]!.canvas!.drawPath(path, paint ?? _emptyPaint);
-    } else {
-      _canvas.drawPath(path, paint ?? _emptyPaint);
-    }
+    _activeCanvas.drawPath(path, paint ?? _emptyPaint);
   }
 
   @override
@@ -348,7 +396,7 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
     if (paintId != null) {
       paint = _paints[paintId];
     }
-    _canvas.drawVertices(vertexData, BlendMode.srcOver, paint ?? _emptyPaint);
+    _activeCanvas.drawVertices(vertexData, BlendMode.srcOver, paint ?? _emptyPaint);
     vertexData.dispose();
   }
 
@@ -438,6 +486,15 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
         _patterns[patternId]!.recorder,
         _patterns[patternId]!.canvas!,
       );
+    } else if (_masks.isNotEmpty) {
+      final _MaskState mask = _masks.last;
+      if (mask.layerDepth > 0) {
+        // Restore a saveLayer within the mask content.
+        mask.layerDepth--;
+        mask.canvas.restore();
+      } else {
+        _finalizeMask(_masks.removeLast());
+      }
     } else {
       _canvas.restore();
     }
@@ -445,18 +502,50 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
 
   @override
   void onSaveLayer(int paintId) {
-    _canvas.saveLayer(null, _paints[paintId]);
+    _activeCanvas.saveLayer(null, _paints[paintId]);
+    if (_currentPattern == null && _masks.isNotEmpty) {
+      _masks.last.layerDepth++;
+    }
   }
 
   @override
   void onMask() {
-    _canvas.saveLayer(null, _grayscaleDstInPaint);
+    if (_currentPattern != null) {
+      // A mask inside a pattern is not supported; keep the previous
+      // behavior of starting a layer on the main canvas.
+      _canvas.saveLayer(null, _lumaToAlphaPaint);
+      return;
+    }
+    // Record the mask content so that it can be replayed twice to apply both
+    // its luminance and its alpha to the destination.
+    final PictureRecorder recorder = _pictureFactory.createPictureRecorder();
+    _masks.add(_MaskState(_canvas, recorder, _pictureFactory.createCanvas(recorder)));
+  }
+
+  /// Applies a finished mask to its parent canvas.
+  ///
+  /// The mask value is `luminance * alpha` per the CSS Masking specification.
+  /// A color matrix cannot compute the product, so the recorded mask content
+  /// is replayed twice: the first pass multiplies the destination alpha by the
+  /// mask's luminance, and the second multiplies it by the mask content's
+  /// alpha. This preserves anti-aliased boundaries and explicit opacity.
+  void _finalizeMask(_MaskState mask) {
+    final Picture maskPicture = mask.recorder.endRecording();
+    final Canvas parentCanvas = mask.parentCanvas;
+    parentCanvas.saveLayer(null, _lumaToAlphaPaint);
+    parentCanvas.drawPicture(maskPicture);
+    parentCanvas.restore();
+    parentCanvas.saveLayer(null, _dstInPaint);
+    parentCanvas.drawPicture(maskPicture);
+    parentCanvas.restore();
+    maskPicture.dispose();
   }
 
   @override
   void onClipPath(int pathId) {
-    _canvas.save();
-    _canvas.clipPath(_paths[pathId]);
+    final Canvas canvas = _activeCanvas;
+    canvas.save();
+    canvas.clipPath(_paths[pathId]);
   }
 
   @override
@@ -727,15 +816,16 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
     if (_pendingChunk.isEmpty) {
       return;
     }
+    final Canvas canvas = _activeCanvas;
     final double originX = _chunkOriginX ?? 0;
     final double anchorOffset = _chunkAdvance * _chunkAnchorMultiplier;
     for (final _PendingTextDraw draw in _pendingChunk) {
       final Paragraph paragraph = draw.paragraph;
       if (draw.transform != null) {
-        _canvas.save();
-        _canvas.transform(draw.transform!);
+        canvas.save();
+        canvas.transform(draw.transform!);
       }
-      _canvas.drawParagraph(
+      canvas.drawParagraph(
         paragraph,
         Offset(
           originX + draw.offsetWithinChunk - anchorOffset,
@@ -744,7 +834,7 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
       );
       paragraph.dispose();
       if (draw.transform != null) {
-        _canvas.restore();
+        canvas.restore();
       }
     }
     _pendingChunk.clear();
@@ -830,18 +920,19 @@ class FlutterVectorGraphicsListener extends VectorGraphicsCodecListener {
     if (image == null) {
       return;
     }
+    final Canvas canvas = _activeCanvas;
     if (transform != null) {
-      _canvas.save();
-      _canvas.transform(transform);
+      canvas.save();
+      canvas.transform(transform);
     }
-    _canvas.drawImageRect(
+    canvas.drawImageRect(
       image,
       Rect.fromLTRB(0, 0, image.width.toDouble(), image.height.toDouble()),
       Rect.fromLTWH(x, y, width, height),
       Paint(),
     );
     if (transform != null) {
-      _canvas.restore();
+      canvas.restore();
     }
   }
 }

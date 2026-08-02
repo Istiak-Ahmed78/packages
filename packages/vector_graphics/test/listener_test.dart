@@ -93,6 +93,101 @@ void main() {
     expect(clipRect.positionalArguments.single, const ui.Rect.fromLTRB(0, 0, 100, 100));
   });
 
+  test('Mask content is applied in two passes: luminance then alpha', () {
+    final factory = _RecordingTestPictureFactory();
+    final listener = FlutterVectorGraphicsListener(pictureFactory: factory);
+    listener.onPaintObject(
+      color: const ui.Color(0xffff0000).toARGB32(),
+      strokeCap: null,
+      strokeJoin: null,
+      blendMode: BlendMode.srcOver.index,
+      strokeMiterLimit: null,
+      strokeWidth: null,
+      paintStyle: ui.PaintingStyle.fill.index,
+      id: 0,
+      shaderId: null,
+    );
+    listener.onPathStart(0, 0);
+    listener.onPathMoveTo(0, 0);
+    listener.onPathLineTo(10, 0);
+    listener.onPathLineTo(10, 10);
+    listener.onPathLineTo(0, 10);
+    listener.onPathClose();
+    listener.onPathFinished();
+
+    // A draw before the mask targets the main canvas.
+    listener.onDrawPath(0, 0, null);
+    listener.onMask();
+    // A draw inside the mask targets the mask recording canvas.
+    listener.onDrawPath(0, 0, null);
+    listener.onRestoreLayer();
+
+    final FakeCanvas mainCanvas = factory.fakeCanvases[0];
+    final FakeCanvas maskCanvas = factory.fakeCanvases[1];
+
+    expect(mainCanvas.invocations.first.memberName, #drawPath);
+    expect(maskCanvas.invocations.single.memberName, #drawPath);
+
+    final Iterable<Symbol> layerOps = mainCanvas.invocations
+        .where(
+          (Invocation invocation) =>
+              invocation.memberName == #saveLayer ||
+              invocation.memberName == #drawPicture ||
+              invocation.memberName == #restore,
+        )
+        .map((Invocation invocation) => invocation.memberName);
+    expect(layerOps, <Symbol>[
+      #saveLayer, // Pass 1: multiply destination alpha by luminance.
+      #drawPicture,
+      #restore,
+      #saveLayer, // Pass 2: multiply destination alpha by mask alpha.
+      #drawPicture,
+      #restore,
+    ]);
+
+    final List<ui.Paint> layerPaints = mainCanvas.invocations
+        .where((Invocation invocation) => invocation.memberName == #saveLayer)
+        .map((Invocation invocation) => invocation.positionalArguments[1] as ui.Paint)
+        .toList();
+    expect(layerPaints[0].blendMode, ui.BlendMode.dstIn);
+    expect(layerPaints[0].colorFilter, isNotNull, reason: 'luminance matrix');
+    expect(layerPaints[1].blendMode, ui.BlendMode.dstIn);
+    expect(layerPaints[1].colorFilter, isNull, reason: 'plain alpha dstIn');
+  });
+
+  test('saveLayer within mask content is restored on the mask canvas', () {
+    final factory = _RecordingTestPictureFactory();
+    final listener = FlutterVectorGraphicsListener(pictureFactory: factory);
+    listener.onPaintObject(
+      color: const ui.Color(0xffff0000).toARGB32(),
+      strokeCap: null,
+      strokeJoin: null,
+      blendMode: BlendMode.srcOver.index,
+      strokeMiterLimit: null,
+      strokeWidth: null,
+      paintStyle: ui.PaintingStyle.fill.index,
+      id: 0,
+      shaderId: null,
+    );
+
+    listener.onMask();
+    listener.onSaveLayer(0);
+    listener.onRestoreLayer(); // Restores the mask canvas, does not finalize.
+    expect(factory.fakeCanvases[0].invocations, isEmpty);
+    expect(
+      factory.fakeCanvases[1].invocations.map((Invocation invocation) => invocation.memberName),
+      <Symbol>[#saveLayer, #restore],
+    );
+
+    listener.onRestoreLayer(); // Finalizes the mask.
+    expect(
+      factory.fakeCanvases[0].invocations
+          .where((Invocation invocation) => invocation.memberName == #saveLayer)
+          .length,
+      2,
+    );
+  });
+
   test('Text position is respected', () async {
     final factory = TestPictureFactory();
     final listener = FlutterVectorGraphicsListener(pictureFactory: factory);
@@ -187,6 +282,109 @@ void main() {
     await listener.waitForImageDecode();
     expect(() => listener.onDrawImage(2, 10, 10, 100, 100, null), throwsAssertionError);
   });
+
+  group('luminance mask', () {
+    // The repro files from https://github.com/flutter/flutter/issues/190125.
+    const maskSvg = '''
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <mask id="m" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="10" y="10" width="80" height="80">
+    <path d="M50 10L90 50L50 90L10 50Z" fill="white"/>
+  </mask>
+  <g mask="url(#m)">
+    <rect width="100" height="100" fill="#1565C0"/>
+  </g>
+</svg>
+''';
+    const clipSvg = '''
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <clipPath id="m">
+    <path d="M50 10L90 50L50 90L10 50Z" fill="white"/>
+  </clipPath>
+  <g clip-path="url(#m)">
+    <rect width="100" height="100" fill="#1565C0"/>
+  </g>
+</svg>
+''';
+    const maskOpacitySvg = '''
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <mask id="m" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="10" y="10" width="80" height="80">
+    <path d="M50 10L90 50L50 90L10 50Z" fill="white" opacity="0.5"/>
+  </mask>
+  <g mask="url(#m)">
+    <rect width="100" height="100" fill="#1565C0"/>
+  </g>
+</svg>
+''';
+
+    Future<ui.Image> renderToImage(String svg) async {
+      final Uint8List bytes = encodeSvg(
+        xml: svg,
+        debugName: 'test',
+        enableClippingOptimizer: false,
+        enableMaskingOptimizer: false,
+        enableOverdrawOptimizer: false,
+      );
+      final PictureInfo info = await decodeVectorGraphics(
+        bytes.buffer.asByteData(),
+        locale: ui.PlatformDispatcher.instance.locale,
+        textDirection: ui.TextDirection.ltr,
+        clipViewbox: true,
+        loader: const AssetBytesLoader('test'),
+      );
+      return info.picture.toImageSync(100, 100);
+    }
+
+    test('antialiases boundaries like an equivalent clipPath', () async {
+      final ui.Image maskImage = await renderToImage(maskSvg);
+      final ui.Image clipImage = await renderToImage(clipSvg);
+      try {
+        final ByteData maskData = (await maskImage.toByteData())!;
+        final ByteData clipData = (await clipImage.toByteData())!;
+        var partialMask = 0;
+        var partialClip = 0;
+        for (var i = 3; i < maskData.lengthInBytes; i += 4) {
+          if (maskData.getUint8(i) > 0 && maskData.getUint8(i) < 255) {
+            partialMask++;
+          }
+          if (clipData.getUint8(i) > 0 && clipData.getUint8(i) < 255) {
+            partialClip++;
+          }
+        }
+        // Before the fix, mask.svg had zero partially-opaque pixels.
+        expect(partialMask, greaterThan(100));
+        expect(partialClip, greaterThan(100));
+        // The masked diamond must match the clip reference along the edge row.
+        for (var x = 26; x <= 36; x++) {
+          final int maskAlpha = maskData.getUint8((30 * 100 + x) * 4 + 3);
+          final int clipAlpha = clipData.getUint8((30 * 100 + x) * 4 + 3);
+          expect(maskAlpha, clipAlpha, reason: 'mask and clip differ at x=$x');
+        }
+      } finally {
+        maskImage.dispose();
+        clipImage.dispose();
+      }
+    }, skip: kIsWeb);
+
+    test('respects mask content opacity', () async {
+      final ui.Image image = await renderToImage(maskOpacitySvg);
+      try {
+        final ByteData data = (await image.toByteData())!;
+        // Interior: luminance(white) * alpha(0.5) -> ~50% opaque.
+        final int centerAlpha = data.getUint8((50 * 100 + 50) * 4 + 3);
+        expect(centerAlpha, inInclusiveRange(100, 155));
+        var partial = 0;
+        for (var i = 3; i < data.lengthInBytes; i += 4) {
+          final int a = data.getUint8(i);
+          if (a > 0 && a < 255) {
+            partial++;
+          }
+        }
+        expect(partial, greaterThan(100));
+      } finally {
+        image.dispose();
+      }
+    }, skip: kIsWeb);
+  });
 }
 
 class TestPictureFactory implements PictureFactory {
@@ -202,6 +400,25 @@ class TestPictureFactory implements PictureFactory {
 }
 
 class FakePictureRecorder extends Fake implements ui.PictureRecorder {}
+
+/// A [PictureFactory] that creates real [ui.PictureRecorder]s (so
+/// [ui.PictureRecorder.endRecording] returns a valid [ui.Picture]) but fake
+/// canvases, so the drawing commands can be inspected.
+class _RecordingTestPictureFactory implements PictureFactory {
+  final List<FakeCanvas> fakeCanvases = <FakeCanvas>[];
+
+  @override
+  ui.Canvas createCanvas(ui.PictureRecorder recorder) {
+    // Bind the recorder so that endRecording() produces a valid Picture; the
+    // returned fake canvas captures the drawing commands for assertions.
+    ui.Canvas(recorder);
+    fakeCanvases.add(FakeCanvas());
+    return fakeCanvases.last;
+  }
+
+  @override
+  ui.PictureRecorder createPictureRecorder() => ui.PictureRecorder();
+}
 
 class FakeCanvas implements ui.Canvas {
   final List<Invocation> invocations = <Invocation>[];

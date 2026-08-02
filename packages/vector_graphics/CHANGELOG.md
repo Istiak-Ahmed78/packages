@@ -1,3 +1,7 @@
+## 1.2.4
+
+* Fixes luminance masks dropping the mask content's alpha, which binarized anti-aliased mask boundaries and ignored `opacity` on mask content (flutter/flutter#190125).
+
 ## 1.2.3
 
 * Updates minimum supported SDK version to Flutter 3.38/Dart 3.10.
